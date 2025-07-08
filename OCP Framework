@@ -20,7 +20,7 @@ from OCP.BRep import BRep_Builder
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.TopoDS import TopoDS_Compound
 from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
-from OCP.GC import GC_MakeCircle
+from OCP.GC import GC_MakeCircle, GC_MakeArcOfCircle
 
 
 def triangular_wave(x, amp, freq, length):
@@ -260,15 +260,15 @@ def main():
         cx2, cy2 = iB * spacing_x + offsetB, jB * spacing_y
         z_bottom = z_start
 
-        # build the semicircular spine between the two tube centers
+        # build the semicircular spine directly in 3D accounting for stagger
         mid_x, mid_y = (cx1 + cx2) / 2, (cy1 + cy2) / 2
         radius = math.hypot(cx2 - cx1, cy2 - cy1) / 2
-        circ_xy = gp_Circ(
-            gp_Ax2(gp_Pnt(mid_x, mid_y, z_bottom), gp_Dir(0, 0, 1)),
-            radius
-        )
+        p1 = gp_Pnt(cx1, cy1, z_bottom)
+        p2 = gp_Pnt(mid_x, mid_y, z_bottom - radius)
+        p3 = gp_Pnt(cx2, cy2, z_bottom)
+        arc = GC_MakeArcOfCircle(p1, p2, p3).Value()
         spine = make_wire_from_edge(
-            BRepBuilderAPI_MakeEdge(circ_xy, 0.0, math.pi).Edge(),
+            BRepBuilderAPI_MakeEdge(arc).Edge(),
             f"Spine row {iA},{jA}->{jB}"
         )
 
@@ -283,16 +283,8 @@ def main():
         pipe_i = BRepOffsetAPI_MakePipe(spine, prof_i)
         u_cut = BRepAlgoAPI_Cut(pipe_o.Shape(), pipe_i.Shape())
         u_bend = u_cut.Shape()
-        assert_valid(u_bend, "Row U-bend before rotation")
-
-                # rotate bend into vertical plane by rotating around X-axis
-        rot_ax = gp_Ax1(gp_Pnt(mid_x, mid_y, z_bottom), gp_Dir(1, 0, 0))
-        trsf = gp_Trsf()
-        # swing the bend from the horizontal XY-plane into the YZ-plane
-        trsf.SetRotation(rot_ax, math.pi/2)
-        u_bend_rot = BRepBuilderAPI_Transform(u_bend, trsf, True).Shape()
-        assert_valid(u_bend_rot, "Row U-bend after X-rotation")
-        builder.Add(stack_comp, u_bend_rot)
+        assert_valid(u_bend, "Row U-bend")
+        builder.Add(stack_comp, u_bend)
 
 # 5d) Horizontal Header connecting tubes (1,1) and (5,1)
     header_r = 8 * outer_r
