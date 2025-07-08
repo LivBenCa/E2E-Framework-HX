@@ -1,0 +1,568 @@
+import faulthandler
+faulthandler.enable()
+
+import math
+import sys
+
+from OCP.TColgp import TColgp_Array2OfPnt
+from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
+from OCP.gp import gp_Pnt, gp_Vec, gp_Ax2, gp_Dir, gp_Trsf, gp_Ax1, gp_Circ
+from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_MakeFace,
+    BRepBuilderAPI_MakeEdge,
+    BRepBuilderAPI_MakeWire,
+    BRepBuilderAPI_Transform,
+)
+from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism, BRepPrimAPI_MakeCylinder
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+from OCP.BRepOffsetAPI import BRepOffsetAPI_MakePipe
+from OCP.BRep import BRep_Builder
+from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.TopoDS import TopoDS_Compound
+from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+from OCP.GC import GC_MakeCircle
+
+
+def triangular_wave(x, amp, freq, length):
+    return (2 * amp / math.pi) * math.asin(
+        math.sin(2 * math.pi * freq * x / length)
+    )
+
+
+def assert_valid(shape, name):
+    if shape.IsNull():
+        raise RuntimeError(f"{name}: shape is null")
+    chk = BRepCheck_Analyzer(shape)
+    if not chk.IsValid():
+        raise RuntimeError(f"{name}: invalid geometry")
+
+
+def make_wire_from_edge(edge, name):
+    wm = BRepBuilderAPI_MakeWire()
+    wm.Add(edge)
+    if not wm.IsDone():
+        raise RuntimeError(f"Wire build for {name} failed")
+    return wm.Wire()
+
+
+def make_cylinder(ax2, r, h, name):
+    mkr = BRepPrimAPI_MakeCylinder(ax2, r, h)
+    cyl = mkr.Shape()
+    assert_valid(cyl, name)
+    return cyl
+
+
+def main():
+    # parameters
+    plate_x, plate_y = 800.0, 600.0
+    plate_z = 1.0
+    cols, rows = 8, 5
+    hole_dia = 12.0
+    hole_r = hole_dia / 2.0
+    amp = 0.4
+    zig_count = 12
+    spacing = 5.0
+    target_height = 1000.0
+    wall_t = 1.0
+    overhang = 10.0
+    stagger_ratio = 0.5
+
+    unit = plate_z + spacing
+    num_plts = int(math.floor((target_height + spacing) / unit))
+    actual_h = num_plts * plate_z + (num_plts - 1) * spacing
+    outer_r, inner_r = hole_r, hole_r - wall_t
+    tube_length = actual_h + 2 * overhang
+    z_start = -overhang
+    
+    print(f"→ Stacking {num_plts} plates → height = {actual_h:.3f} mm")
+
+    # 1) Build undulated plate
+    nx, ny = 80, 2
+    pts = TColgp_Array2OfPnt(1, nx, 1, ny)
+    for i in range(1, nx + 1):
+        x = (i - 1) / (nx - 1) * plate_x
+        z = triangular_wave(x, amp, zig_count, plate_x)
+        for j in (1, 2):
+            pts.SetValue(i, j, gp_Pnt(x, (j - 1) * plate_y, z))
+    surf = GeomAPI_PointsToBSplineSurface(pts).Surface()
+    face_mkr = BRepBuilderAPI_MakeFace(surf, 1e-5)
+    if not face_mkr.IsDone():
+        raise RuntimeError("MakeFace failed")
+    face = face_mkr.Face()
+
+    prism_mkr = BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, plate_z))
+    if not prism_mkr.IsDone():
+        raise RuntimeError("MakePrism failed")
+    plate = prism_mkr.Shape()
+    assert_valid(plate, "Prism plate")
+
+    # 2) Subtract holes
+    spacing_x = plate_x / (cols + 1)
+    spacing_y = plate_y / (rows + 1)
+    cyl_h = plate_z + 2 * amp
+    builder = BRep_Builder()
+    hole_comp = TopoDS_Compound()
+    builder.MakeCompound(hole_comp)
+    for i in range(1, cols + 1):
+        for j in range(1, rows + 1):
+            offset_x = stagger_ratio * spacing_x if j % 2 == 0 else 0.0
+            ax2 = gp_Ax2(gp_Pnt(i * spacing_x + offset_x, j * spacing_y, 0), gp_Dir(0, 0, 1))
+            cyl = make_cylinder(ax2, hole_r, cyl_h, f"Hole cyl ({i},{j})")
+            builder.Add(hole_comp, cyl)
+    cut1 = BRepAlgoAPI_Cut(plate, hole_comp)
+    if not cut1.IsDone():
+        raise RuntimeError("Cut holes failed")
+    plate = cut1.Shape()
+    assert_valid(plate, "Plate after holes")
+
+    # 3) Stack plates
+    stack_comp = TopoDS_Compound()
+    builder.MakeCompound(stack_comp)
+    for n in range(num_plts):
+        tr = gp_Trsf()
+        tr.SetTranslation(gp_Vec(0, 0, n * unit))
+        tf = BRepBuilderAPI_Transform(plate, tr, True)
+        if not tf.IsDone():
+            raise RuntimeError(f"Transform plate #{n} failed")
+        builder.Add(stack_comp, tf.Shape())
+
+    # 4) Create straight tubes
+    tube_dict = {}  # keep references to each tube for U-bend connections
+    for i in range(1, cols + 1):
+        for j in range(1, rows + 1):
+            offset_x = stagger_ratio * spacing_x if j % 2 == 0 else 0.0
+            base = gp_Pnt(i * spacing_x + offset_x, j * spacing_y, z_start)
+            ax2 = gp_Ax2(base, gp_Dir(0, 0, 1))
+            outer = make_cylinder(ax2, outer_r, tube_length, f"Outer tube ({i},{j})")
+            inner = make_cylinder(ax2, inner_r, tube_length, f"Inner tube ({i},{j})")
+            hollow_cut = BRepAlgoAPI_Cut(outer, inner)
+            if not hollow_cut.IsDone():
+                raise RuntimeError(f"Hollow cut failed for tube ({i},{j})")
+            tube = hollow_cut.Shape()
+            assert_valid(tube, f"Hollow tube ({i},{j})")
+            builder.Add(stack_comp, tube)
+            tube_dict[(i, j)] = tube
+
+    # 5a) U-bend connections (top)
+    bend_pairs = [((1,1),(2,1)), ((3,1),(4,1)), ((4,2),(3,2)), ((2,2),(1,2)),
+                  ((1,3),(2,3)), ((3,3),(4,3)), ((4,4),(3,4)), ((2,4),(1,4)),
+                  ((1,5),(2,5)), ((3,5),(4,5)), ((5,1),(6,1)), ((7,1),(8,1)),
+                  ((8,2),(7,2)), ((6,2),(5,2)), ((5,3),(6,3)), ((7,3),(8,3)),
+                  ((8,4),(7,4)), ((6,4),(5,4)), ((5,5),(6,5)), ((7,5),(8,5))]
+    for (iA, jA), (iB, jB) in bend_pairs:
+        # correct stagger for both ends
+        offsetA = stagger_ratio * spacing_x if (jA % 2 == 0) else 0.0
+        offsetB = stagger_ratio * spacing_x if (jB % 2 == 0) else 0.0
+        cx1, cy1 = iA * spacing_x + offsetA, jA * spacing_y
+        cx2, cy2 = iB * spacing_x + offsetB, jB * spacing_y
+        z_end = z_start + tube_length
+
+        circ_xy = gp_Circ(
+            gp_Ax2(gp_Pnt((cx1 + cx2) / 2, cy1, z_end), gp_Dir(0,0,1)),
+            abs(cx2 - cx1)/2
+        )
+        spine = make_wire_from_edge(
+            BRepBuilderAPI_MakeEdge(circ_xy, 0.0, math.pi).Edge(),
+            f"Spine {iA}->{iB}"
+        )
+
+        prof_ax = gp_Ax2(gp_Pnt(cx1, cy1, z_end), gp_Dir(0,-1,0), gp_Dir(0,0,1))
+        circ_o = GC_MakeCircle(prof_ax, outer_r).Value()
+        circ_i = GC_MakeCircle(prof_ax, inner_r).Value()
+        prof_o = make_wire_from_edge(BRepBuilderAPI_MakeEdge(circ_o).Edge(), "U-bend outer")
+        prof_i = make_wire_from_edge(BRepBuilderAPI_MakeEdge(circ_i).Edge(), "U-bend inner")
+
+        pipe_o = BRepOffsetAPI_MakePipe(spine, prof_o)
+        pipe_i = BRepOffsetAPI_MakePipe(spine, prof_i)
+        u_cut = BRepAlgoAPI_Cut(pipe_o.Shape(), pipe_i.Shape())
+        u_bend = u_cut.Shape()
+        assert_valid(u_bend, "U-bend before rotation")
+
+        center = gp_Pnt((cx1+cx2)/2, cy1, z_end)
+        rot = gp_Trsf()
+        rot.SetRotation(gp_Ax1(center, gp_Dir(1,0,0)), math.pi/2)
+        u_tf = BRepBuilderAPI_Transform(u_bend, rot, True)
+        if not u_tf.IsDone():
+            raise RuntimeError("Rotate U-bend failed")
+        u_bend = u_tf.Shape()
+
+        # fuse or add separately
+        f1 = BRepAlgoAPI_Fuse(tube_dict[(iA,jA)], u_bend)
+        if f1.IsDone():
+            f2 = BRepAlgoAPI_Fuse(f1.Shape(), tube_dict[(iB,jB)])
+            if f2.IsDone(): builder.Add(stack_comp, f2.Shape())
+            else:
+                builder.Add(stack_comp, tube_dict[(iA,jA)])
+                builder.Add(stack_comp, u_bend)
+                builder.Add(stack_comp, tube_dict[(iB,jB)])
+        else:
+            builder.Add(stack_comp, tube_dict[(iA,jA)])
+            builder.Add(stack_comp, u_bend)
+            builder.Add(stack_comp, tube_dict[(iB,jB)])
+
+    # 5b) U-bend connections (bottom, opposite)
+    bend_pairs_opposite = [((2,1),(3,1)), ((3,2),(2,2)), ((2,3),(3,3)), ((3,4),(2,4)),
+                           ((2,5),(3,5)), ((6,1),(7,1)), ((7,2),(6,2)), ((6,3),(7,3)),
+                           ((7,4),(6,4)), ((6,5),(7,5))]
+    for (iA, jA), (iB, jB) in bend_pairs_opposite:
+        offsetA = stagger_ratio * spacing_x if (jA % 2 == 0) else 0.0
+        offsetB = stagger_ratio * spacing_x if (jB % 2 == 0) else 0.0
+        cx1, cy1 = iA * spacing_x + offsetA, jA * spacing_y
+        cx2, cy2 = iB * spacing_x + offsetB, jB * spacing_y
+        z_bottom = z_start
+
+        circ_xy = gp_Circ(gp_Ax2(gp_Pnt((cx1+cx2)/2, cy1, z_bottom), gp_Dir(0,0,1)), abs(cx2-cx1)/2)
+        spine = make_wire_from_edge(
+            BRepBuilderAPI_MakeEdge(circ_xy, 0.0, math.pi).Edge(),
+            f"Spine {iA}->{iB} bottom"
+        )
+        prof_ax = gp_Ax2(gp_Pnt(cx1, cy1, z_bottom), gp_Dir(0,-1,0), gp_Dir(0,0,1))
+        circ_o = GC_MakeCircle(prof_ax, outer_r).Value()
+        circ_i = GC_MakeCircle(prof_ax, inner_r).Value()
+        prof_o = make_wire_from_edge(BRepBuilderAPI_MakeEdge(circ_o).Edge(), "U-bend outer")
+        prof_i = make_wire_from_edge(BRepBuilderAPI_MakeEdge(circ_i).Edge(), "U-bend inner")
+
+        pipe_o = BRepOffsetAPI_MakePipe(spine, prof_o)
+        pipe_i = BRepOffsetAPI_MakePipe(spine, prof_i)
+        u_cut = BRepAlgoAPI_Cut(pipe_o.Shape(), pipe_i.Shape())
+        u_bend = u_cut.Shape()
+        assert_valid(u_bend, "U-bend bottom before rotation")
+
+        center = gp_Pnt((cx1+cx2)/2, cy1, z_bottom)
+        rot = gp_Trsf()
+        rot.SetRotation(gp_Ax1(center, gp_Dir(-1,0,0)), math.pi/2)
+        u_tf = BRepBuilderAPI_Transform(u_bend, rot, True)
+        if not u_tf.IsDone(): raise RuntimeError("Rotate U-bend bottom failed")
+        u_bend = u_tf.Shape()
+
+        f1 = BRepAlgoAPI_Fuse(tube_dict[(iA,jA)], u_bend)
+        if f1.IsDone():
+            f2 = BRepAlgoAPI_Fuse(f1.Shape(), tube_dict[(iB,jB)])
+            if f2.IsDone(): builder.Add(stack_comp, f2.Shape())
+            else:
+                builder.Add(stack_comp, tube_dict[(iA,jA)])
+                builder.Add(stack_comp, u_bend)
+                builder.Add(stack_comp, tube_dict[(iB,jB)])
+        else:
+            builder.Add(stack_comp, tube_dict[(iA,jA)])
+            builder.Add(stack_comp, u_bend)
+            builder.Add(stack_comp, tube_dict[(iB,jB)])
+
+    # 5c) U-bend connections between rows (Y-direction) at bottom
+    bend_pairs_rows = [((4,1),(4,2)), ((1,2),(1,3)), ((4,3),(4,4)), ((1,4),(1,5)),
+                       ((8,1),(8,2)), ((5,2),(5,3)), ((8,3),(8,4)), ((5,4),(5,5))]
+    for (iA, jA), (iB, jB) in bend_pairs_rows:
+        # compute x-offsets for both tubes, as they may differ in stagger
+        offsetA = stagger_ratio * spacing_x if (jA % 2 == 0) else 0.0
+        offsetB = stagger_ratio * spacing_x if (jB % 2 == 0) else 0.0
+        # start and end positions
+        cx1, cy1 = iA * spacing_x + offsetA, jA * spacing_y
+        cx2, cy2 = iB * spacing_x + offsetB, jB * spacing_y
+        z_bottom = z_start
+
+        # build the semicircular spine between the two tube centers
+        mid_x, mid_y = (cx1 + cx2) / 2, (cy1 + cy2) / 2
+        radius = math.hypot(cx2 - cx1, cy2 - cy1) / 2
+        circ_xy = gp_Circ(
+            gp_Ax2(gp_Pnt(mid_x, mid_y, z_bottom), gp_Dir(0, 0, 1)),
+            radius
+        )
+        spine = make_wire_from_edge(
+            BRepBuilderAPI_MakeEdge(circ_xy, 0.0, math.pi).Edge(),
+            f"Spine row {iA},{jA}->{jB}"
+        )
+
+        # profile at the start tube’s position
+        prof_ax = gp_Ax2(gp_Pnt(cx1, cy1, z_bottom), gp_Dir(0, -1, 0), gp_Dir(0, 0, 1))
+        circ_o = GC_MakeCircle(prof_ax, outer_r).Value()
+        circ_i = GC_MakeCircle(prof_ax, inner_r).Value()
+        prof_o = make_wire_from_edge(BRepBuilderAPI_MakeEdge(circ_o).Edge(), "Row U-bend outer")
+        prof_i = make_wire_from_edge(BRepBuilderAPI_MakeEdge(circ_i).Edge(), "Row U-bend inner")
+
+        pipe_o = BRepOffsetAPI_MakePipe(spine, prof_o)
+        pipe_i = BRepOffsetAPI_MakePipe(spine, prof_i)
+        u_cut = BRepAlgoAPI_Cut(pipe_o.Shape(), pipe_i.Shape())
+        u_bend = u_cut.Shape()
+        assert_valid(u_bend, "Row U-bend before rotation")
+
+                # rotate bend into vertical plane by rotating around X-axis
+        rot_ax = gp_Ax1(gp_Pnt(mid_x, mid_y, z_bottom), gp_Dir(1, 0, 0))
+        trsf = gp_Trsf()
+        # swing the bend from the horizontal XY-plane into the YZ-plane
+        trsf.SetRotation(rot_ax, math.pi/2)
+        u_bend_rot = BRepBuilderAPI_Transform(u_bend, trsf, True).Shape()
+        assert_valid(u_bend_rot, "Row U-bend after X-rotation")
+        builder.Add(stack_comp, u_bend_rot)
+
+# 5d) Horizontal Header connecting tubes (1,1) and (5,1)
+    header_r = 8 * outer_r
+    x1 = 0.0
+    x2 = plate_x
+    y = 1 * spacing_y # + 0.5 * header_r offset slightly in +Y
+    z = z_start - 3.0 * header_r 
+
+    # Header axis along X
+    header_ax = gp_Ax2(gp_Pnt(x1, y, z), gp_Dir(1, 0, 0))
+    header_length = abs(x2 - x1)
+    header_pipe = make_cylinder(header_ax, header_r, header_length, "Horizontal header pipe")
+
+    # Add to compound
+    builder.Add(stack_comp, header_pipe)
+    print("✅ Horizontal header pipe added between tubes (1,1) and (5,1)")
+
+    # -- Header Ends (Caps) --
+    cap_thickness = wall_t
+
+    # Cap at x1
+    cap_ax1 = gp_Ax2(gp_Pnt(x1, y, z), gp_Dir(-1, 0, 0))  # facing left
+    cap1 = make_cylinder(cap_ax1, header_r, cap_thickness, "Header cap 1")
+    builder.Add(stack_comp, cap1)
+
+    # Cap at x2
+    cap_ax2 = gp_Ax2(gp_Pnt(x2, y, z), gp_Dir(1, 0, 0))  # facing right
+    cap2 = make_cylinder(cap_ax2, header_r, cap_thickness, "Header cap 2")
+    builder.Add(stack_comp, cap2)
+
+    print("✅ Header end caps added.")
+
+    # 5e) Drill vertical holes into header for connecting tubes
+    drill_comp = TopoDS_Compound()
+    builder.MakeCompound(drill_comp)
+
+    drill_length = 1.5 * header_r  # long enough to cut through header
+    drill_dir = gp_Dir(0, 0, -1)  # Z-direction
+
+    # Define the tubes that should connect into the header (same as header span)
+    connected_tubes = [(1, 1), (5, 1)]  # You can add more if needed
+
+    for (i, j) in connected_tubes:
+        offset_x = stagger_ratio * spacing_x if j % 2 == 0 else 0.0
+        px = i * spacing_x + offset_x
+        py = j * spacing_y
+        pz = z  # header Z center (from earlier)
+
+        ax2 = gp_Ax2(gp_Pnt(px, py, pz + drill_length), drill_dir)
+        drill_cyl = make_cylinder(ax2, hole_r, drill_length, f"Drill hole for ({i},{j})")
+        builder.Add(drill_comp, drill_cyl)
+
+    # Cut holes into header pipe
+    header_with_holes = BRepAlgoAPI_Cut(header_pipe, drill_comp)
+    if not header_with_holes.IsDone():
+        raise RuntimeError("Cutting drill holes into header failed")
+    header_with_holes = header_with_holes.Shape()
+    assert_valid(header_with_holes, "Header with drilled holes")
+
+    # Replace original header pipe with drilled version
+    builder.Remove(stack_comp, header_pipe)
+    builder.Add(stack_comp, header_with_holes)
+
+    print("✅ Vertical holes drilled into header.")
+
+    # 5f) Add vertical connection tubes from coils to header
+    for (i, j) in connected_tubes:
+        offset_x = stagger_ratio * spacing_x if j % 2 == 0 else 0.0
+        px = i * spacing_x + offset_x
+        py = j * spacing_y
+        coil_top_z = z_start  # bottom of coil stack
+        header_center_z = z   # z-position of header center
+
+        # Determine the direction of connection (from coil to header)
+        if coil_top_z > header_center_z:
+            conn_dir = gp_Dir(0, 0, -1)
+            height = coil_top_z - header_center_z
+            base_z = coil_top_z
+        else:
+            conn_dir = gp_Dir(0, 0, 1)
+            height = header_center_z - coil_top_z
+            base_z = coil_top_z
+
+        # Optional: add small margin
+        height += 2.0  # mm
+
+        # Outer shell
+        ax2_outer = gp_Ax2(gp_Pnt(px, py, base_z), conn_dir)
+        outer = make_cylinder(ax2_outer, outer_r, height, f"Connector outer ({i},{j})")
+
+        # Inner cut
+        ax2_inner = gp_Ax2(gp_Pnt(px, py, base_z), conn_dir)
+        inner = make_cylinder(ax2_inner, inner_r, height, f"Connector inner ({i},{j})")
+
+        # Hollow tube (like coils)
+        conn_cut = BRepAlgoAPI_Cut(outer, inner)
+        if not conn_cut.IsDone():
+            raise RuntimeError(f"Connector cut failed at ({i},{j})")
+
+        connector = conn_cut.Shape()
+        assert_valid(connector, f"Connector tube ({i},{j})")
+        builder.Add(stack_comp, connector)
+
+    print("✅ Coil-header connectors added.")
+
+    # 5g) Add vertical inlet pipe (same diameter as header)
+    inlet_length = 80.0  # adjust as needed (visible pipe length)
+    inlet_direction = gp_Dir(0, 0, -1)  # +Z → goes upwards; use (0,0,-1) for downwards
+
+    # Inlet enters at center of header (can be changed to x1 or x2)
+    inlet_offset = 250.0  # mm → change as needed
+    inlet_x = (x1 + x2) / 2 + inlet_offset
+
+    inlet_y = y  # same y-position as header
+    inlet_base_z = z  # center of header
+
+    # Starting point: below if direction is up, above if direction is down
+    base_z = inlet_base_z if inlet_direction.Z() < 0 else inlet_base_z - inlet_length
+    inlet_origin = gp_Pnt(inlet_x, inlet_y, base_z)
+
+    # Build inlet pipe
+    inlet_ax = gp_Ax2(inlet_origin, inlet_direction)
+    # Outer shell
+    outer_inlet = make_cylinder(inlet_ax, header_r, inlet_length, "Inlet outer")
+
+    # Inner cut
+    inner_inlet = make_cylinder(inlet_ax, header_r - wall_t, inlet_length, "Inlet inner")
+
+    # Hollow pipe
+    inlet_cut = BRepAlgoAPI_Cut(outer_inlet, inner_inlet)
+    if not inlet_cut.IsDone():
+        raise RuntimeError("Cutting inlet pipe failed")
+    inlet_pipe = inlet_cut.Shape()
+    assert_valid(inlet_pipe, "Hollow inlet pipe")
+
+
+    # Cut a hole in the header and fuse inlet in
+    fused_inlet = BRepAlgoAPI_Fuse(header_with_holes, inlet_pipe)
+    if not fused_inlet.IsDone():
+        raise RuntimeError("Fusing vertical inlet failed")
+
+    header_with_inlet = fused_inlet.Shape()
+    assert_valid(header_with_inlet, "Header with vertical inlet")
+
+    # Replace old header with updated one
+    builder.Remove(stack_comp, header_with_holes)
+    builder.Add(stack_comp, header_with_inlet)
+
+    print("✅ Vertical inlet pipe added to header.")
+
+    # 5h) Top horizontal header connecting tubes (1,5) and (5,5)
+    top_header_r = 8 * outer_r
+    top_x1 = 0.0
+    top_x2 = plate_x
+    top_y = 5 * spacing_y - outer_r  # move behind coil row
+    top_z = z_start - 3.0 * top_header_r  # same as bottom header
+
+    # Header axis along X
+    top_header_ax = gp_Ax2(gp_Pnt(top_x1, top_y, top_z), gp_Dir(1, 0, 0))
+    top_header_length = abs(top_x2 - top_x1)
+    top_header_pipe = make_cylinder(top_header_ax, top_header_r, top_header_length, "Top horizontal header pipe")
+    builder.Add(stack_comp, top_header_pipe)
+    print("✅ Top header pipe added between tubes (1,5) and (5,5)")
+
+    # -- Header End Caps --
+    cap_thickness = wall_t
+
+    cap_ax1 = gp_Ax2(gp_Pnt(top_x1, top_y, top_z), gp_Dir(-1, 0, 0))
+    cap1 = make_cylinder(cap_ax1, top_header_r, cap_thickness, "Top header cap 1")
+    builder.Add(stack_comp, cap1)
+
+    cap_ax2 = gp_Ax2(gp_Pnt(top_x2, top_y, top_z), gp_Dir(1, 0, 0))
+    cap2 = make_cylinder(cap_ax2, top_header_r, cap_thickness, "Top header cap 2")
+    builder.Add(stack_comp, cap2)
+    print("✅ Top header end caps added.")
+
+    # Drill vertical holes into top header
+    top_drill_comp = TopoDS_Compound()
+    builder.MakeCompound(top_drill_comp)
+
+    top_drill_length = 1.5 * top_header_r
+    top_drill_dir = gp_Dir(0, 0, -1)
+    top_connected_tubes = [(4, 5), (8, 5)]
+
+    for (i, j) in top_connected_tubes:
+        offset_x = stagger_ratio * spacing_x if j % 2 == 0 else 0.0
+        px = i * spacing_x + offset_x
+        py = j * spacing_y
+        pz = top_z
+        ax2 = gp_Ax2(gp_Pnt(px, py, pz + top_drill_length), top_drill_dir)
+        drill_cyl = make_cylinder(ax2, hole_r, top_drill_length, f"Top drill hole for ({i},{j})")
+        builder.Add(top_drill_comp, drill_cyl)
+
+    top_header_with_holes = BRepAlgoAPI_Cut(top_header_pipe, top_drill_comp)
+    if not top_header_with_holes.IsDone():
+        raise RuntimeError("Cutting drill holes into top header failed")
+    top_header_with_holes = top_header_with_holes.Shape()
+    assert_valid(top_header_with_holes, "Top header with drilled holes")
+    builder.Remove(stack_comp, top_header_pipe)
+    builder.Add(stack_comp, top_header_with_holes)
+    print("✅ Vertical holes drilled into top header.")
+
+    # Add vertical connectors from coils to top header
+    for (i, j) in top_connected_tubes:
+        offset_x = stagger_ratio * spacing_x if j % 2 == 0 else 0.0
+        px = i * spacing_x + offset_x
+        py = j * spacing_y
+        coil_top_z = z_start + tube_length  # top of coil stack
+        header_center_z = top_z
+
+        if coil_top_z > header_center_z:
+            conn_dir = gp_Dir(0, 0, -1)
+            height = coil_top_z - header_center_z
+            base_z = coil_top_z
+        else:
+            conn_dir = gp_Dir(0, 0, 1)
+            height = header_center_z - coil_top_z
+            base_z = coil_top_z
+
+        height += 2.0  # safety margin
+
+        ax2_outer = gp_Ax2(gp_Pnt(px, py, base_z), conn_dir)
+        outer = make_cylinder(ax2_outer, outer_r, height, f"Top connector outer ({i},{j})")
+        ax2_inner = gp_Ax2(gp_Pnt(px, py, base_z), conn_dir)
+        inner = make_cylinder(ax2_inner, inner_r, height, f"Top connector inner ({i},{j})")
+
+        conn_cut = BRepAlgoAPI_Cut(outer, inner)
+        if not conn_cut.IsDone():
+            raise RuntimeError(f"Top connector cut failed at ({i},{j})")
+        connector = conn_cut.Shape()
+        assert_valid(connector, f"Top connector tube ({i},{j})")
+        builder.Add(stack_comp, connector)
+
+    print("✅ Top coil-header connectors added.")
+
+    # Add vertical outlet pipe (same size as header)
+    top_inlet_length = 80.0
+    top_inlet_direction = gp_Dir(0, 0, -1)  # upward
+    top_inlet_offset = -250.0  # shift along X
+    top_inlet_x = (top_x1 + top_x2) / 2 + top_inlet_offset
+    top_inlet_y = top_y
+    top_inlet_base_z = top_z
+
+    top_base_z = top_inlet_base_z if top_inlet_direction.Z() < 0 else top_inlet_base_z - top_inlet_length
+    top_inlet_origin = gp_Pnt(top_inlet_x, top_inlet_y, top_base_z)
+
+    top_inlet_ax = gp_Ax2(top_inlet_origin, top_inlet_direction)
+    outer_inlet = make_cylinder(top_inlet_ax, top_header_r, top_inlet_length, "Top inlet outer")
+    inner_inlet = make_cylinder(top_inlet_ax, top_header_r - wall_t, top_inlet_length, "Top inlet inner")
+    inlet_cut = BRepAlgoAPI_Cut(outer_inlet, inner_inlet)
+    if not inlet_cut.IsDone():
+        raise RuntimeError("Top inlet hollowing failed")
+    top_inlet_pipe = inlet_cut.Shape()
+    assert_valid(top_inlet_pipe, "Top inlet pipe")
+
+    fused_top = BRepAlgoAPI_Fuse(top_header_with_holes, top_inlet_pipe)
+    if not fused_top.IsDone():
+        raise RuntimeError("Fusing top header with inlet failed")
+    top_header_final = fused_top.Shape()
+    builder.Remove(stack_comp, top_header_with_holes)
+    builder.Add(stack_comp, top_header_final)
+
+    print("✅ Top vertical outlet pipe added to header.")
+    
+    # 6) Export STEP
+    writer = STEPControl_Writer()
+    writer.Transfer(stack_comp, STEPControl_AsIs)
+    if writer.Write("stacked_plate_block_with_multiple_ubends.step") != 1:
+        raise RuntimeError("STEP export failed")
+    print("✅ STEP file written successfully.")
+
+if __name__ == "__main__":
+    main()
